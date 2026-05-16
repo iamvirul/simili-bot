@@ -1,7 +1,7 @@
 // Author: Kaviru Hapuarachchi
 // GitHub: https://github.com/kavirubc
 // Created: 2026-02-02
-// Last Modified: 2026-02-17
+// Last Modified: 2026-05-17
 
 package commands
 
@@ -120,13 +120,13 @@ func runProcess() {
 	if issueFile != "" {
 		data, err := os.ReadFile(issueFile)
 		if err != nil {
-			fmt.Printf("Error reading issue file: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error reading issue file: %v\n", err)
 			os.Exit(1)
 		}
 
 		// Attempt to unmarshal directly
 		if err := json.Unmarshal(data, &issue); err != nil {
-			fmt.Printf("Error parsing issue JSON: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error parsing issue JSON: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -166,7 +166,7 @@ func runProcess() {
 	} else if issueNum != 0 {
 		org, repo := resolveIssueRepo(orgName, repoName)
 		if org == "" || repo == "" {
-			fmt.Println("Error: when using --number, provide --repo owner/name or --org owner --repo name, or set GITHUB_REPOSITORY")
+			fmt.Fprintln(os.Stderr, "Error: when using --number, provide --repo owner/name or --org owner --repo name, or set GITHUB_REPOSITORY")
 			os.Exit(1)
 		}
 
@@ -175,14 +175,14 @@ func runProcess() {
 			token = os.Getenv("GITHUB_TOKEN")
 		}
 		if token == "" {
-			fmt.Println("Error: GITHUB_TOKEN (or TRANSFER_TOKEN) is required to fetch issue from GitHub")
+			fmt.Fprintln(os.Stderr, "Error: GITHUB_TOKEN (or TRANSFER_TOKEN) is required to fetch issue from GitHub")
 			os.Exit(1)
 		}
 
 		ghClient := github.NewClient(context.Background(), token)
 		ghIssue, err := ghClient.GetIssue(context.Background(), org, repo, issueNum)
 		if err != nil {
-			fmt.Printf("Error fetching issue from GitHub: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error fetching issue from GitHub: %v\n", err)
 			os.Exit(1)
 		}
 
