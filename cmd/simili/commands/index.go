@@ -175,69 +175,76 @@ func runIndex(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Issue/PR producer — context-aware so a cancelled gctx unblocks channel
-	// sends and allows workers to drain and return.
-	opts := &github.IssueListByRepoOptions{
-		State:       "all",
-		Sort:        "created",
-		Direction:   "asc",
-		ListOptions: github.ListOptions{PerPage: 100},
-	}
-
-	if indexSince != "" {
-		t, parseErr := time.Parse(time.RFC3339, indexSince)
-		if parseErr == nil {
-			opts.Since = t
-		} else {
-			log.Printf("Warning: Could not parse --since as ISO8601, ignoring (fetching all)")
-		}
-	}
-
-	page := 1
-produce:
-	for {
-		opts.Page = page
-		issues, resp, err := ghClient.ListIssues(gctx, org, repoName, opts)
-		if err != nil {
-			log.Printf("Error listing issues page %d: %v", page, err)
-			break
-		}
-
-		if len(issues) == 0 {
-			break
-		}
-
-		log.Printf("Fetched page %d (%d issues)", page, len(issues))
-
-		for _, issue := range issues {
-			if !indexIncludePRs && issue.IsPullRequest() {
-				continue
+	// Issue/PR producer — runs inside errgroup so that a panic or early exit
+	// always closes the job channels via defer, unblocking workers and
+	// guaranteeing g.Wait() returns. This mirrors the batch.go sender pattern.
+	prJobsCapture := prJobs // capture for the closure
+	g.Go(func() error {
+		defer close(jobs)
+		defer func() {
+			if prJobsCapture != nil {
+				close(prJobsCapture)
 			}
-			// Route PRs to the dedicated channel when available; otherwise fall
-			// through to the issues collection (backward compatibility).
-			var ch chan Job
-			if issue.IsPullRequest() && prJobs != nil {
-				ch = prJobs
+		}()
+
+		opts := &github.IssueListByRepoOptions{
+			State:       "all",
+			Sort:        "created",
+			Direction:   "asc",
+			ListOptions: github.ListOptions{PerPage: 100},
+		}
+
+		if indexSince != "" {
+			t, parseErr := time.Parse(time.RFC3339, indexSince)
+			if parseErr == nil {
+				opts.Since = t
 			} else {
-				ch = jobs
-			}
-			select {
-			case ch <- Job{Issue: issue}:
-			case <-gctx.Done():
-				break produce
+				log.Printf("Warning: Could not parse --since as ISO8601, ignoring (fetching all)")
 			}
 		}
 
-		if resp.NextPage == 0 {
-			break
-		}
-		page = resp.NextPage
-	}
+		page := 1
+		for {
+			opts.Page = page
+			issues, resp, err := ghClient.ListIssues(gctx, org, repoName, opts)
+			if err != nil {
+				log.Printf("Error listing issues page %d: %v", page, err)
+				break
+			}
 
-	close(jobs)
-	if prJobs != nil {
-		close(prJobs)
-	}
+			if len(issues) == 0 {
+				break
+			}
+
+			log.Printf("Fetched page %d (%d issues)", page, len(issues))
+
+			for _, issue := range issues {
+				if !indexIncludePRs && issue.IsPullRequest() {
+					continue
+				}
+				// Route PRs to the dedicated channel when available; otherwise fall
+				// through to the issues collection (backward compatibility).
+				var ch chan Job
+				if issue.IsPullRequest() && prJobsCapture != nil {
+					ch = prJobsCapture
+				} else {
+					ch = jobs
+				}
+				select {
+				case ch <- Job{Issue: issue}:
+				case <-gctx.Done():
+					return gctx.Err()
+				}
+			}
+
+			if resp.NextPage == 0 {
+				break
+			}
+			page = resp.NextPage
+		}
+		return nil
+	})
+
 	if err := g.Wait(); err != nil {
 		log.Fatalf("Indexing failed: %v", err)
 	}

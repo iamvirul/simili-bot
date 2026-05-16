@@ -200,8 +200,8 @@ func runBatch(cmd *cobra.Command, args []string) {
 	fmt.Printf("Processing %d issues with %d workers...\n", len(issues), batchWorkers)
 	results, batchErr := processBatch(ctx, issues, cfg, deps, stepNames)
 	if batchErr != nil {
-		fmt.Fprintf(os.Stderr, "❌ Batch encountered a fatal worker error: %v\n", batchErr)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "⚠️  Batch encountered a worker error: %v\n", batchErr)
+		fmt.Fprintf(os.Stderr, "   Partial results (%d issues) will still be written.\n", len(results))
 	}
 
 	// 6.5. Resolve duplicate chains across batch results (post-processing)
@@ -224,6 +224,11 @@ func runBatch(cmd *cobra.Command, args []string) {
 		}
 	}
 	fmt.Printf("\n✓ Batch processing completed: %d successful, %d failed\n", successful, failed)
+
+	// Exit non-zero if a worker panicked/failed so CI detects the failure.
+	if batchErr != nil {
+		os.Exit(1)
+	}
 }
 
 // loadIssues reads and parses a JSON file containing an array of issues
