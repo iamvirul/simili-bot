@@ -200,7 +200,8 @@ func runBatch(cmd *cobra.Command, args []string) {
 	fmt.Printf("Processing %d issues with %d workers...\n", len(issues), batchWorkers)
 	results, batchErr := processBatch(ctx, issues, cfg, deps, stepNames)
 	if batchErr != nil {
-		fmt.Printf("❌ Batch encountered a fatal worker error: %v\n", batchErr)
+		fmt.Fprintf(os.Stderr, "❌ Batch encountered a fatal worker error: %v\n", batchErr)
+		os.Exit(1)
 	}
 
 	// 6.5. Resolve duplicate chains across batch results (post-processing)
