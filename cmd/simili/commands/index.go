@@ -11,10 +11,10 @@ import (
 	"log"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/go-github/v60/github"
+	"golang.org/x/sync/errgroup"
 	"github.com/google/uuid"
 	similiConfig "github.com/similigh/simili-bot/internal/core/config"
 	"github.com/similigh/simili-bot/internal/integrations/ai"
@@ -135,17 +135,23 @@ func runIndex(cmd *cobra.Command, args []string) {
 	}
 
 	jobs := make(chan Job, indexWorkers)
-	var wg sync.WaitGroup
+
+	g, gctx := errgroup.WithContext(ctx)
 
 	// Issue workers.
 	for i := 0; i < indexWorkers; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
+		id := i
+		g.Go(func() (retErr error) {
+			defer func() {
+				if r := recover(); r != nil {
+					retErr = fmt.Errorf("issue worker %d panicked: %v", id, r)
+				}
+			}()
 			for job := range jobs {
-				processIssue(ctx, id, job.Issue, ghClient, embedder, qdrantClient, splitter, cfg.Qdrant.Collection, org, repoName, indexDryRun)
+				processIssue(gctx, id, job.Issue, ghClient, embedder, qdrantClient, splitter, cfg.Qdrant.Collection, org, repoName, indexDryRun)
 			}
-		}(i)
+			return nil
+		})
 	}
 
 	// PR workers — only when a dedicated PR collection is configured.
@@ -153,17 +159,23 @@ func runIndex(cmd *cobra.Command, args []string) {
 	if indexIncludePRs && cfg.Qdrant.PRCollection != "" {
 		prJobs = make(chan Job, indexWorkers)
 		for i := 0; i < indexWorkers; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
+			id := i
+			g.Go(func() (retErr error) {
+				defer func() {
+					if r := recover(); r != nil {
+						retErr = fmt.Errorf("PR worker %d panicked: %v", id, r)
+					}
+				}()
 				for job := range prJobs {
-					processPullRequest(ctx, id, job.Issue, ghClient, embedder, qdrantClient, splitter, cfg.Qdrant.PRCollection, org, repoName, indexDryRun)
+					processPullRequest(gctx, id, job.Issue, ghClient, embedder, qdrantClient, splitter, cfg.Qdrant.PRCollection, org, repoName, indexDryRun)
 				}
-			}(i)
+				return nil
+			})
 		}
 	}
 
-	// Issue/PR producer.
+	// Issue/PR producer — context-aware so a cancelled gctx unblocks channel
+	// sends and allows workers to drain and return.
 	opts := &github.IssueListByRepoOptions{
 		State:       "all",
 		Sort:        "created",
@@ -181,9 +193,10 @@ func runIndex(cmd *cobra.Command, args []string) {
 	}
 
 	page := 1
+produce:
 	for {
 		opts.Page = page
-		issues, resp, err := ghClient.ListIssues(ctx, org, repoName, opts)
+		issues, resp, err := ghClient.ListIssues(gctx, org, repoName, opts)
 		if err != nil {
 			log.Printf("Error listing issues page %d: %v", page, err)
 			break
@@ -201,10 +214,16 @@ func runIndex(cmd *cobra.Command, args []string) {
 			}
 			// Route PRs to the dedicated channel when available; otherwise fall
 			// through to the issues collection (backward compatibility).
+			var ch chan Job
 			if issue.IsPullRequest() && prJobs != nil {
-				prJobs <- Job{Issue: issue}
+				ch = prJobs
 			} else {
-				jobs <- Job{Issue: issue}
+				ch = jobs
+			}
+			select {
+			case ch <- Job{Issue: issue}:
+			case <-gctx.Done():
+				break produce
 			}
 		}
 
@@ -218,7 +237,9 @@ func runIndex(cmd *cobra.Command, args []string) {
 	if prJobs != nil {
 		close(prJobs)
 	}
-	wg.Wait()
+	if err := g.Wait(); err != nil {
+		log.Printf("Indexing completed with worker errors: %v", err)
+	}
 	log.Println("Indexing complete.")
 }
 

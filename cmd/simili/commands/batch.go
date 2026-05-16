@@ -14,8 +14,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
 
@@ -367,29 +368,36 @@ func initializeDependencies(cfg *config.Config) (*pipeline.Dependencies, error) 
 	return deps, nil
 }
 
-// processBatch processes all issues using a worker pool pattern
+// processBatch processes all issues using a worker pool pattern.
+// Uses errgroup so that a panicking or early-exiting worker cancels the shared
+// context, unblocks the job sender, and guarantees g.Wait() always returns.
 func processBatch(ctx context.Context, issues []pipeline.Issue, cfg *config.Config, deps *pipeline.Dependencies, stepNames []string) []BatchResult {
 	jobs := make(chan BatchJob, batchWorkers)
-	results := make(chan BatchResult, batchWorkers)
-	var wg sync.WaitGroup
+	// Buffer all results so workers never block on send after context cancel.
+	results := make(chan BatchResult, len(issues))
 
-	// Start workers
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Workers: recover panics via named return so errgroup sees the failure.
 	for i := 0; i < batchWorkers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
+		workerID := i
+		g.Go(func() (retErr error) {
+			defer func() {
+				if r := recover(); r != nil {
+					retErr = fmt.Errorf("worker %d panicked: %v", workerID, r)
+				}
+			}()
 			for job := range jobs {
 				if verbose {
 					fmt.Printf("[Worker %d] Processing issue #%d (%s/%s)\n", workerID, job.Issue.Number, job.Issue.Org, job.Issue.Repo)
 				}
 
-				result, err := ExecutePipeline(ctx, &job.Issue, cfg, deps, stepNames, true)
+				result, err := ExecutePipeline(gctx, &job.Issue, cfg, deps, stepNames, true)
 
-				results <- BatchResult{
-					Index:  job.Index,
-					Issue:  job.Issue,
-					Result: result,
-					Error:  err,
+				select {
+				case results <- BatchResult{Index: job.Index, Issue: job.Issue, Result: result, Error: err}:
+				case <-gctx.Done():
+					return gctx.Err()
 				}
 
 				if verbose {
@@ -400,24 +408,32 @@ func processBatch(ctx context.Context, issues []pipeline.Issue, cfg *config.Conf
 					}
 				}
 			}
-		}(i)
+			return nil
+		})
 	}
 
-	// Send jobs
-	go func() {
+	// Sender: close jobs on exit so workers always drain and return.
+	g.Go(func() error {
+		defer close(jobs)
 		for i, issue := range issues {
-			jobs <- BatchJob{Index: i, Issue: issue}
+			select {
+			case jobs <- BatchJob{Index: i, Issue: issue}:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
 		}
-		close(jobs)
-	}()
+		return nil
+	})
 
-	// Collect results
+	// Close results once every worker and the sender have exited.
+	// g.Wait() is guaranteed to return because context cancellation unblocks all
+	// select statements above, so this goroutine cannot leak.
 	go func() {
-		wg.Wait()
+		_ = g.Wait()
 		close(results)
 	}()
 
-	// Gather results in order
+	// Gather results in order.
 	resultMap := make(map[int]BatchResult)
 	for result := range results {
 		resultMap[result.Index] = result
