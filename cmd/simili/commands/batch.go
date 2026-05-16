@@ -198,7 +198,10 @@ func runBatch(cmd *cobra.Command, args []string) {
 
 	// 6. Process batch
 	fmt.Printf("Processing %d issues with %d workers...\n", len(issues), batchWorkers)
-	results := processBatch(ctx, issues, cfg, deps, stepNames)
+	results, batchErr := processBatch(ctx, issues, cfg, deps, stepNames)
+	if batchErr != nil {
+		fmt.Printf("❌ Batch encountered a fatal worker error: %v\n", batchErr)
+	}
 
 	// 6.5. Resolve duplicate chains across batch results (post-processing)
 	resolveDuplicateChains(results)
@@ -371,14 +374,15 @@ func initializeDependencies(cfg *config.Config) (*pipeline.Dependencies, error) 
 // processBatch processes all issues using a worker pool pattern.
 // Uses errgroup so that a panicking or early-exiting worker cancels the shared
 // context, unblocks the job sender, and guarantees g.Wait() always returns.
-func processBatch(ctx context.Context, issues []pipeline.Issue, cfg *config.Config, deps *pipeline.Dependencies, stepNames []string) []BatchResult {
-	jobs := make(chan BatchJob, batchWorkers)
-	// Buffer all results so workers never block on send after context cancel.
+// Returns the first worker/panic error alongside the (possibly partial) results.
+func processBatch(ctx context.Context, issues []pipeline.Issue, cfg *config.Config, deps *pipeline.Dependencies, stepNames []string) ([]BatchResult, error) {
+	// Buffer all results up front; workers never block on send.
 	results := make(chan BatchResult, len(issues))
+	jobs := make(chan BatchJob, batchWorkers)
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	// Workers: recover panics via named return so errgroup sees the failure.
+	// Workers: retErr is set by the deferred recover so errgroup sees panics.
 	for i := 0; i < batchWorkers; i++ {
 		workerID := i
 		g.Go(func() (retErr error) {
@@ -394,11 +398,8 @@ func processBatch(ctx context.Context, issues []pipeline.Issue, cfg *config.Conf
 
 				result, err := ExecutePipeline(gctx, &job.Issue, cfg, deps, stepNames, true)
 
-				select {
-				case results <- BatchResult{Index: job.Index, Issue: job.Issue, Result: result, Error: err}:
-				case <-gctx.Done():
-					return gctx.Err()
-				}
+				// results is buffered to len(issues) so this send never blocks.
+				results <- BatchResult{Index: job.Index, Issue: job.Issue, Result: result, Error: err}
 
 				if verbose {
 					if err != nil {
@@ -425,26 +426,33 @@ func processBatch(ctx context.Context, issues []pipeline.Issue, cfg *config.Conf
 		return nil
 	})
 
-	// Close results once every worker and the sender have exited.
-	// g.Wait() is guaranteed to return because context cancellation unblocks all
-	// select statements above, so this goroutine cannot leak.
+	// Drain results concurrently while blocking on g.Wait() below.
+	// This goroutine exits as soon as results is closed, which happens
+	// immediately after g.Wait() returns — it cannot leak.
+	collected := make(chan map[int]BatchResult, 1)
 	go func() {
-		_ = g.Wait()
-		close(results)
+		m := make(map[int]BatchResult, len(issues))
+		for r := range results {
+			m[r.Index] = r
+		}
+		collected <- m
 	}()
 
-	// Gather results in order.
-	resultMap := make(map[int]BatchResult)
-	for result := range results {
-		resultMap[result.Index] = result
-	}
+	waitErr := g.Wait() // blocks until all workers + sender exit
+	close(results)      // safe: all senders (workers) are done
+	resultMap := <-collected
 
+	// Stamp any slots that workers dropped on cancellation/panic with the error.
 	orderedResults := make([]BatchResult, len(issues))
-	for i := range issues {
-		orderedResults[i] = resultMap[i]
+	for i, issue := range issues {
+		if r, ok := resultMap[i]; ok {
+			orderedResults[i] = r
+		} else if waitErr != nil {
+			orderedResults[i] = BatchResult{Index: i, Issue: issue, Error: waitErr}
+		}
 	}
 
-	return orderedResults
+	return orderedResults, waitErr
 }
 
 // outputResults formats and writes results to the specified output

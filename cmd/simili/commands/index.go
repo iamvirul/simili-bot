@@ -14,14 +14,15 @@ import (
 	"time"
 
 	"github.com/google/go-github/v60/github"
-	"golang.org/x/sync/errgroup"
 	"github.com/google/uuid"
+	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
+
 	similiConfig "github.com/similigh/simili-bot/internal/core/config"
 	"github.com/similigh/simili-bot/internal/integrations/ai"
 	similiGithub "github.com/similigh/simili-bot/internal/integrations/github"
 	"github.com/similigh/simili-bot/internal/integrations/qdrant"
 	"github.com/similigh/simili-bot/internal/utils/text"
-	"github.com/spf13/cobra"
 )
 
 var (
@@ -238,7 +239,7 @@ produce:
 		close(prJobs)
 	}
 	if err := g.Wait(); err != nil {
-		log.Printf("Indexing completed with worker errors: %v", err)
+		log.Fatalf("Indexing failed: %v", err)
 	}
 	log.Println("Indexing complete.")
 }
