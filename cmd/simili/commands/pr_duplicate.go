@@ -143,44 +143,70 @@ func runPRDuplicate(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// 5. Embedder + embed PR content.
-	embedder, err := ai.NewEmbedder(cfg.Embedding.APIKey, cfg.Embedding.Model)
-	if err != nil {
-		log.Fatalf("Failed to init embedder: %v", err)
-	}
-	defer embedder.Close()
-
-	content := buildPREmbeddingContent(pr.GetTitle(), pr.GetBody(), filePaths)
-	vec, err := embedder.Embed(ctx, content)
-	if err != nil {
-		log.Fatalf("Failed to embed PR content: %v", err)
-	}
-
-	// 6. Qdrant client.
-	qdrantClient, err := qdrant.NewClient(cfg.Qdrant.URL, cfg.Qdrant.APIKey)
-	if err != nil {
-		log.Fatalf("Failed to init Qdrant: %v", err)
-	}
-	defer qdrantClient.Close()
-
-	// 7. Search issues collection.
-	issueHits, err := qdrantClient.Search(ctx, cfg.Qdrant.Collection, vec, prDupTopK, prDupThreshold)
-	if err != nil {
-		log.Printf("Warning: failed to search issues collection: %v", err)
-		issueHits = nil
-	}
-
-	// 8. Search PR collection when configured.
+	var issueHits []*qdrant.SearchResult
 	var prHits []*qdrant.SearchResult
-	if cfg.Qdrant.PRCollection != "" {
-		prHits, err = qdrantClient.Search(ctx, cfg.Qdrant.PRCollection, vec, prDupTopK, prDupThreshold)
-		if err != nil {
-			log.Printf("Warning: failed to search PR collection: %v", err)
-		}
-	}
 
-	// 9. Merge, deduplicate, and sort candidates.
-	out.Candidates = mergeSearchResults(issueHits, prHits, prDupNumber)
+	if cfg.Search.Backend == "qdrant" {
+		// 5. Embedder + embed PR content.
+		embedder, err := ai.NewEmbedder(cfg.Embedding.APIKey, cfg.Embedding.Model)
+		if err != nil {
+			log.Fatalf("Failed to init embedder: %v", err)
+		}
+		defer embedder.Close()
+
+		content := buildPREmbeddingContent(pr.GetTitle(), pr.GetBody(), filePaths)
+		vec, err := embedder.Embed(ctx, content)
+		if err != nil {
+			log.Fatalf("Failed to embed PR content: %v", err)
+		}
+
+		// 6. Qdrant client.
+		qdrantClient, err := qdrant.NewClient(cfg.Qdrant.URL, cfg.Qdrant.APIKey)
+		if err != nil {
+			log.Fatalf("Failed to init Qdrant: %v", err)
+		}
+		defer qdrantClient.Close()
+
+		// 7. Search issues collection.
+		issueHits, err = qdrantClient.Search(ctx, cfg.Qdrant.Collection, vec, prDupTopK, prDupThreshold)
+		if err != nil {
+			log.Printf("Warning: failed to search issues collection: %v", err)
+			issueHits = nil
+		}
+
+		// 8. Search PR collection when configured.
+		if cfg.Qdrant.PRCollection != "" {
+			prHits, err = qdrantClient.Search(ctx, cfg.Qdrant.PRCollection, vec, prDupTopK, prDupThreshold)
+			if err != nil {
+				log.Printf("Warning: failed to search PR collection: %v", err)
+			}
+		}
+
+		// 9. Merge, deduplicate, and sort candidates.
+		out.Candidates = mergeSearchResults(issueHits, prHits, prDupNumber)
+	} else if cfg.Search.Backend == "github_native" {
+		log.Printf("Search backend is %q. Using GitHub native search fallback.", cfg.Search.Backend)
+		searcher := similiGithub.NewSearcher(ctx, token)
+		query := pr.GetTitle()
+		hits, _, err := searcher.SearchIssues(ctx, org, repoName, query, "", prDupTopK)
+		if err != nil {
+			log.Printf("Warning: failed to search GitHub natively: %v", err)
+		}
+		for _, h := range hits {
+			if h.Number == prDupNumber {
+				continue
+			}
+			out.Candidates = append(out.Candidates, PRCandidate{
+				Type:   h.Type,
+				Number: h.Number,
+				Title:  h.Title,
+				Score:  1.0, // GitHub native search doesn't return vector scores
+				URL:    h.URL,
+			})
+		}
+	} else {
+		log.Printf("Search backend %q is not supported for pr-duplicate fallback. Returning 0 candidates.", cfg.Search.Backend)
+	}
 
 	// 10. Optional LLM duplicate verdict on top-3 candidates.
 	llmKey := cfg.LLM.APIKey

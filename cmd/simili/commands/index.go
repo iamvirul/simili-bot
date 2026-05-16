@@ -79,7 +79,13 @@ func runIndex(cmd *cobra.Command, args []string) {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// 2. Auth & Clients
+	// 2. Check Backend
+	if cfg.Search.Backend != "" && cfg.Search.Backend != "qdrant" {
+		log.Printf("Search backend is %q. No indexing required for this backend. Exiting.", cfg.Search.Backend)
+		return
+	}
+
+	// 3. Auth & Clients
 	token := indexToken
 	if token == "" {
 		token = os.Getenv("GITHUB_TOKEN")
@@ -90,7 +96,10 @@ func runIndex(cmd *cobra.Command, args []string) {
 
 	ghClient := similiGithub.NewClient(ctx, token)
 
-	embedder, err := ai.NewEmbedder(cfg.Embedding.APIKey, cfg.Embedding.Model)
+	var embedder *ai.Embedder
+	var qdrantClient *qdrant.Client
+
+	embedder, err = ai.NewEmbedder(cfg.Embedding.APIKey, cfg.Embedding.Model)
 	if err != nil {
 		log.Fatalf("Failed to init embedder: %v", err)
 	}
@@ -100,7 +109,6 @@ func runIndex(cmd *cobra.Command, args []string) {
 		embeddingDimensions = dim
 	}
 
-	var qdrantClient *qdrant.Client
 	if !indexDryRun {
 		qdrantClient, err = qdrant.NewClient(cfg.Qdrant.URL, cfg.Qdrant.APIKey)
 		if err != nil {
@@ -300,6 +308,8 @@ func processPullRequest(ctx context.Context, workerID int, issue *github.Issue, 
 	// 4. Chunk.
 	chunks := splitter.SplitText(content)
 
+
+
 	// 5. Embed.
 	embeddings, err := em.EmbedBatch(ctx, chunks)
 	if err != nil {
@@ -377,6 +387,8 @@ func processIssue(ctx context.Context, workerID int, issue *github.Issue, gh *si
 
 	// 3. Chunk
 	chunks := splitter.SplitText(fullText)
+
+
 
 	// 4. Embed
 	embeddings, err := em.EmbedBatch(ctx, chunks)

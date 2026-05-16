@@ -292,9 +292,8 @@ func applyConfigOverrides(cfg *config.Config) {
 func initializeDependencies(cfg *config.Config) (*pipeline.Dependencies, error) {
 	deps := &pipeline.Dependencies{}
 
-	// Embedder — required for qdrant backend; also initialized for other backends
-	// when an embedding API key is present (e.g. VDB routing may need it).
-	if cfg.Search.Backend == "" || cfg.Search.Backend == "qdrant" || cfg.Embedding.APIKey != "" {
+	// Embedder and VectorStore are only initialized for the qdrant backend.
+	if cfg.Search.Backend == "qdrant" {
 		embedder, err := ai.NewEmbedder(cfg.Embedding.APIKey, cfg.Embedding.Model)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize embedder: %w", err)
@@ -303,33 +302,37 @@ func initializeDependencies(cfg *config.Config) (*pipeline.Dependencies, error) 
 		if verbose {
 			fmt.Printf("✓ Initialized Embedder (%s) with model: %s\n", embedder.Provider(), embedder.Model())
 		}
-	}
 
-	// Initialize Qdrant Client
-	qURL := cfg.Qdrant.URL
-	if val := os.Getenv("QDRANT_URL"); val != "" && (qURL == "" || qURL == "localhost:6334") {
-		qURL = val
-	}
-
-	qKey := cfg.Qdrant.APIKey
-	if val := os.Getenv("QDRANT_API_KEY"); val != "" && qKey == "" {
-		qKey = val
-	}
-
-	// Only initialize Qdrant if a real URL is configured (not empty, not default localhost)
-	if qURL != "" && qURL != "localhost:6334" {
-		if verbose {
-			fmt.Printf("✓ Connecting to Qdrant at %s\n", qURL)
+		// Initialize Qdrant Client
+		qURL := cfg.Qdrant.URL
+		if val := os.Getenv("QDRANT_URL"); val != "" && (qURL == "" || qURL == "localhost:6334") {
+			qURL = val
 		}
 
-		qdrantClient, err := qdrant.NewClient(qURL, qKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize Qdrant client: %w", err)
+		qKey := cfg.Qdrant.APIKey
+		if val := os.Getenv("QDRANT_API_KEY"); val != "" && qKey == "" {
+			qKey = val
 		}
-		deps.VectorStore = qdrantClient
+
+		// Only initialize Qdrant if a real URL is configured (not empty, not default localhost)
+		if qURL != "" && qURL != "localhost:6334" {
+			if verbose {
+				fmt.Printf("✓ Connecting to Qdrant at %s\n", qURL)
+			}
+
+			qdrantClient, err := qdrant.NewClient(qURL, qKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize Qdrant client: %w", err)
+			}
+			deps.VectorStore = qdrantClient
+		} else {
+			if verbose {
+				fmt.Println("ℹ Qdrant not configured — skipping vector store initialization")
+			}
+		}
 	} else {
 		if verbose {
-			fmt.Println("ℹ Qdrant not configured — skipping vector store initialization")
+			fmt.Printf("ℹ Search backend is %q — skipping Embedder and Qdrant initialization\n", cfg.Search.Backend)
 		}
 	}
 
