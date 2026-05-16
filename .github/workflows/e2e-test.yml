@@ -2,15 +2,19 @@
 # E2E Integration Test Pipeline for Simili Bot
 # =============================================================================
 # Triggers on every PR to main. Creates a test repo under the bot user account,
-# seeds it with issues, indexes them, installs the PR version of Simili,
-# then verifies duplicate detection and loop safety.
+# seeds it with issues, then verifies duplicate detection and loop safety.
 #
-# Required secrets:
+# Runs a strategy matrix with two backends:
+#   github_native – zero-config, no Qdrant/embedding secrets needed
+#   qdrant        – full VDB pipeline, requires Qdrant + Gemini secrets
+#
+# Required secrets (all backends):
 #   BOT_PAT          – Bot user PAT (repo, workflow scopes)
 #   BOT_USERNAME     – Bot user's GitHub username (must start with "gh-simili")
+#   GEMINI_API_KEY   – Gemini API key (LLM verdicts)
+# Additional secrets (qdrant backend only):
 #   QDRANT_URL       – Qdrant cluster URL
 #   QDRANT_API_KEY   – Qdrant API key
-#   GEMINI_API_KEY   – Gemini API key
 # =============================================================================
 
 name: Simili E2E Test
@@ -37,8 +41,6 @@ permissions:
   pull-requests: write
 
 env:
-  TEST_REPO_NAME: "simili-e2e-${{ github.run_id }}"
-  TEST_COLLECTION: "simili-e2e-test-${{ github.run_id }}"
   # Bot username — not sensitive (visible in all URLs/logs).
   # Declared as plain env var so GitHub does NOT mask it (it would
   # be masked if derived from the BOT_USERNAME secret).
@@ -46,11 +48,19 @@ env:
 
 jobs:
   e2e-test:
-    name: E2E Integration Test
+    name: E2E Integration Test (${{ matrix.backend }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Only run if the 'e2e' label was added (or manual trigger)
     if: github.event.label.name == 'e2e' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [github_native, qdrant]
+    env:
+      # Per-leg resource names prevent matrix legs from colliding
+      TEST_REPO_NAME: "simili-e2e-${{ github.run_id }}-${{ matrix.backend }}"
+      TEST_COLLECTION: "simili-e2e-test-${{ github.run_id }}-${{ matrix.backend }}"
 
     steps:
       # ----- 0. Validate secrets -----
@@ -59,14 +69,16 @@ jobs:
           missing=""
           [ -z "${{ secrets.BOT_PAT }}" ]      && missing="$missing BOT_PAT"
           [ -z "${{ secrets.BOT_USERNAME }}" ]  && missing="$missing BOT_USERNAME"
-          [ -z "${{ secrets.QDRANT_URL }}" ]    && missing="$missing QDRANT_URL"
-          [ -z "${{ secrets.QDRANT_API_KEY }}" ] && missing="$missing QDRANT_API_KEY"
           [ -z "${{ secrets.GEMINI_API_KEY }}" ] && missing="$missing GEMINI_API_KEY"
+          if [ "${{ matrix.backend }}" = "qdrant" ]; then
+            [ -z "${{ secrets.QDRANT_URL }}" ]    && missing="$missing QDRANT_URL"
+            [ -z "${{ secrets.QDRANT_API_KEY }}" ] && missing="$missing QDRANT_API_KEY"
+          fi
           if [ -n "$missing" ]; then
             echo "::error::Missing secrets:$missing"
             exit 1
           fi
-          echo "✅ All required secrets present"
+          echo "✅ All required secrets present (backend: ${{ matrix.backend }})"
 
       # ----- 1. Create test repo (public, so devs can inspect) -----
       - name: Create test repository
@@ -93,10 +105,26 @@ jobs:
           Auto-created by the Simili Bot E2E pipeline. Kept for inspection.
           READMEEOF
 
-          # .github/simili.yaml
+          # .github/simili.yaml — backend-specific
           mkdir -p .github
           COLLECTION="${{ env.TEST_COLLECTION }}"
-          cat > .github/simili.yaml << 'CFGEOF'
+
+          if [ "${{ matrix.backend }}" = "github_native" ]; then
+            cat > .github/simili.yaml << 'CFGEOF'
+          search:
+            backend: github_native
+            bm25_fallback: true
+          workflow: issue-triage-github
+          llm:
+            provider: gemini
+            api_key: ${GEMINI_API_KEY}
+            model: gemini-2.5-flash
+          defaults:
+            similarity_threshold: 0.15
+            max_similar_to_show: 5
+          CFGEOF
+          else
+            cat > .github/simili.yaml << 'CFGEOF'
           qdrant:
             url: ${QDRANT_URL}
             api_key: ${QDRANT_API_KEY}
@@ -114,7 +142,8 @@ jobs:
             similarity_threshold: 0.65
             max_similar_to_show: 3
           CFGEOF
-          sed -i "s/%COLLECTION%/$COLLECTION/g" .github/simili.yaml
+            sed -i "s/%COLLECTION%/$COLLECTION/g" .github/simili.yaml
+          fi
 
           git add -A
           git commit -m "chore: seed E2E test config"
@@ -131,11 +160,13 @@ jobs:
           B_NAME: ${{ env.BOT_NAME }}
         run: |
           REPO="${{ env.BOT_NAME }}/${{ env.TEST_REPO_NAME }}"
-          gh secret set QDRANT_URL    --repo "$REPO" --body "$QDR_URL"
-          gh secret set QDRANT_API_KEY --repo "$REPO" --body "$QDR_KEY"
           gh secret set GEMINI_API_KEY --repo "$REPO" --body "$GEM_KEY"
           gh secret set GH_PAT        --repo "$REPO" --body "$B_PAT"
           gh secret set BOT_USERNAME  --repo "$REPO" --body "$B_NAME"
+          if [ "${{ matrix.backend }}" = "qdrant" ]; then
+            gh secret set QDRANT_URL    --repo "$REPO" --body "$QDR_URL"
+            gh secret set QDRANT_API_KEY --repo "$REPO" --body "$QDR_KEY"
+          fi
 
       # ----- 4. Create 5 seed issues -----
       - name: Create seed issues
@@ -165,9 +196,8 @@ jobs:
             --body "The navigation menu overlaps with the main content area on iPhone 12 and below when using Safari. The hamburger menu does not collapse properly after selecting a menu item."
 
       # ----- 5. Build CLI from PR & index seed issues -----
-      # ----- 5. Build CLI from PR & index seed issues -----
       - name: Checkout PR code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # Explicitly checkout the PR code
           # If triggered by review: pull_request.head.sha
@@ -187,6 +217,7 @@ jobs:
           go build -o "$RUNNER_TEMP/simili-cli" ./cmd/simili/main.go
 
       - name: Index seed issues
+        if: matrix.backend == 'qdrant'
         env:
           GITHUB_TOKEN: ${{ secrets.BOT_PAT }}
           QDRANT_URL: ${{ secrets.QDRANT_URL }}
@@ -217,9 +248,27 @@ jobs:
             --config "$RUNNER_TEMP/index-cfg.yaml" \
             --workers 2
 
-      # ----- 6. Let the index settle -----
-      - name: Wait for index
-        run: sleep 15
+      # ----- 6. Let the index settle (qdrant: active poll; github_native: skip) -----
+      - name: Wait for Qdrant index
+        if: matrix.backend == 'qdrant'
+        env:
+          QDR_URL: ${{ secrets.QDRANT_URL }}
+          QDR_KEY: ${{ secrets.QDRANT_API_KEY }}
+        run: |
+          COLLECTION="${{ env.TEST_COLLECTION }}"
+          for i in $(seq 1 12); do
+            COUNT=$(curl -sf "$QDR_URL/collections/$COLLECTION" \
+              -H "api-key: $QDR_KEY" \
+              | jq '.result.points_count // 0' 2>/dev/null || echo "0")
+            if [ "$COUNT" -ge 5 ]; then
+              echo "✅ Qdrant index settled ($COUNT points)"
+              exit 0
+            fi
+            echo "  Poll $i/12 — $COUNT points, waiting…"
+            sleep 5
+          done
+          echo "⚠️ Qdrant index did not settle in time"
+          exit 1
 
       # ----- 7. Push triage workflow to test repo -----
       - name: Enable Simili workflow
@@ -241,7 +290,7 @@ jobs:
               types: [created]
 
           concurrency:
-            group: simili-${{ github.event.issue.number || github.event.pull_request.number }}
+            group: simili-__DOLLAR__{{ github.event.issue.number || github.event.pull_request.number }}
             cancel-in-progress: false
 
           permissions:
@@ -251,38 +300,56 @@ jobs:
           jobs:
             triage:
               runs-on: ubuntu-latest
-              # Skip only when the bot itself posts a comment (prevents feedback loop).
-              # Always run for issues: opened/edited events.
               if: >
                 github.event_name != 'issue_comment' ||
                 (github.actor != 'gh-simili-bot' && github.actor != 'github-actions[bot]')
               steps:
                 - name: Checkout
-                  uses: actions/checkout@v4
+                  uses: actions/checkout@v5
 
                 - name: Run Simili Bot
                   uses: similigh/simili-bot@__PR_SHA__
                   env:
-                    QDRANT_URL: ${{ secrets.QDRANT_URL }}
-                    QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
-                    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-                    SIMILI_E2E_TEST_USER: ${{ secrets.BOT_USERNAME }}
+                    GEMINI_API_KEY: __DOLLAR__{{ secrets.GEMINI_API_KEY }}
+                    SIMILI_E2E_TEST_USER: __DOLLAR__{{ secrets.BOT_USERNAME }}
+                    __QDRANT_ENV_BLOCK__
                   with:
                     config_path: .github/simili.yaml
                     command: process
           WFEOF
 
-          # Generate workflow from template
-          # Uses the PR SHA so we test the PR code, not main
-          # Fallback to inputs.sha for manual dispatch
+          # Replace __DOLLAR__ with literal $ so the test repo's workflow
+          # sees real ${{ }} expressions (not interpolated by the outer workflow).
+          sed -i 's|__DOLLAR__|$|g' .github/workflows/triage.yml
+
+          # Replace __PR_SHA__ with the actual commit to test
           SHA="${{ github.event.pull_request.head.sha || inputs.sha }}"
           sed -i "s|__PR_SHA__|$SHA|g" .github/workflows/triage.yml
+
+          # Inject backend-specific Qdrant env vars
+          if [ "${{ matrix.backend }}" = "qdrant" ]; then
+            # Build the literal YAML lines with __DOLLAR__ already replaced above
+            sed -i 's|__QDRANT_ENV_BLOCK__|QDRANT_URL: ${{ secrets.QDRANT_URL }}\n                    QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}|g' .github/workflows/triage.yml
+          else
+            sed -i '/__QDRANT_ENV_BLOCK__/d' .github/workflows/triage.yml
+          fi
 
           git add -A
           git commit -m "chore: enable Simili Triage workflow"
           git push origin HEAD:main
-          echo "Waiting 15s for GitHub to register the workflow…"
-          sleep 15
+
+          # Poll for workflow registration instead of hardcoded sleep
+          echo "Waiting for GitHub to register the workflow…"
+          for i in $(seq 1 6); do
+            WF_COUNT=$(gh api "repos/${{ env.BOT_NAME }}/${{ env.TEST_REPO_NAME }}/actions/workflows" \
+              --jq '.total_count' 2>/dev/null || echo "0")
+            if [ "$WF_COUNT" -gt 0 ]; then
+              echo "✅ Workflow registered"
+              break
+            fi
+            echo "  Poll $i/6 — no workflows yet…"
+            sleep 5
+          done
 
       # ----- 7b. Create auto-closer test issue -----
       # Created BEFORE the trigger issue so it ages long enough to exceed the
@@ -386,16 +453,17 @@ jobs:
           ISSUE="${{ steps.trigger.outputs.issue_number }}"
           BOT="github-actions[bot]"
 
-          echo "Waiting 60 s for potential re-triggers…"
-          sleep 60
-
-          N=$(gh api "repos/$REPO/issues/$ISSUE/comments" \
-            --jq "[.[] | select(.user.login == \"$BOT\")] | length")
-          echo "Bot comments on trigger issue: $N"
-          if [ "$N" -gt 1 ]; then
-            echo "❌ LOOP DETECTED – bot commented $N times"
-            exit 1
-          fi
+          echo "Polling for potential re-triggers (6 × 10 s)…"
+          for i in $(seq 1 6); do
+            N=$(gh api "repos/$REPO/issues/$ISSUE/comments" \
+              --jq "[.[] | select(.user.login == \"$BOT\")] | length")
+            if [ "$N" -gt 1 ]; then
+              echo "❌ LOOP DETECTED – bot commented $N times"
+              exit 1
+            fi
+            echo "  Poll $i/6 – $N comment(s), OK"
+            sleep 10
+          done
           echo "✅ No loop – single comment"
 
       # ----- 11b. Auto-closer E2E test -----
@@ -459,9 +527,9 @@ jobs:
             echo "⚠️  Auto-closer found no issues to process (AC test issue may not be labeled yet)"
           fi
 
-      # ----- 12. Cleanup Qdrant (always) -----
+      # ----- 12. Cleanup Qdrant (qdrant backend only) -----
       - name: Cleanup Qdrant collection
-        if: always()
+        if: always() && matrix.backend == 'qdrant'
         run: |
           CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
             "${{ secrets.QDRANT_URL }}/collections/${{ env.TEST_COLLECTION }}" \
@@ -491,6 +559,7 @@ jobs:
           | Detail | Value |
           |--------|-------|
           | **PR** | [#${PR_NUM}](https://github.com/${{ github.repository }}/pull/${PR_NUM}) |
+          | **Backend** | ${{ matrix.backend }} |
           | **Commit** | \`${CO_SHA:0:7}\` |
           | **Bot responded** | $([ "$BOT_OK" = "true" ] && echo "✅" || echo "❌") |
           | **Date** | $(date -u '+%Y-%m-%d %H:%M UTC') |
@@ -528,7 +597,7 @@ jobs:
 
           gh pr comment "$PR_NUM" \
             --repo "${{ github.repository }}" \
-            --body "## 🧪 E2E Test
+            --body "## 🧪 E2E Test (${{ matrix.backend }})
 
           ${ICON} **Bot responded:** $([ "$OK" = "true" ] && echo "yes" || echo "no")
 
@@ -544,7 +613,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "## E2E Test Summary"
+            echo "## E2E Test Summary (${{ matrix.backend }})"
             echo ""
             echo "| Check | Result |"
             echo "|-------|--------|"

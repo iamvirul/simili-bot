@@ -1,0 +1,36 @@
+# =============================================================================
+# Remove the "e2e" label when new commits are pushed to a PR.
+# This ensures a maintainer must re-approve E2E runs after code changes.
+# =============================================================================
+
+name: Reset E2E Label
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  remove-e2e-label:
+    name: Remove e2e label on push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove e2e label if present
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          # Check if the label exists on this PR
+          HAS_LABEL=$(gh api "repos/$REPO/issues/$PR/labels" \
+            --jq '[.[] | select(.name == "e2e")] | length' 2>/dev/null || echo "0")
+
+          if [ "$HAS_LABEL" -gt 0 ]; then
+            gh api -X DELETE "repos/$REPO/issues/$PR/labels/e2e" || true
+            echo "🏷️ Removed 'e2e' label from PR #$PR — re-add to re-run E2E tests"
+          else
+            echo "No 'e2e' label on PR #$PR — nothing to do"
+          fi
