@@ -110,6 +110,8 @@ simili index --repo owner/repo --workers 5 --limit 100
 - `--limit`: Maximum issues to index
 - `--dry-run`: Simulate without writing to database
 
+**Error handling:** If any worker encounters an unrecoverable error (including a panic), the command exits with a non-zero status code and logs the failure. All in-flight workers are cancelled cleanly before exit — the process will not hang.
+
 ### `simili process`
 
 Process a single issue through the pipeline.
@@ -148,6 +150,8 @@ simili batch --file issues.json --format csv --out-file results.csv --workers 5
 - `--threshold`: Override similarity threshold
 - `--duplicate-threshold`: Override duplicate confidence threshold
 - `--top-k`: Override max similar issues to show
+
+**Error handling:** Worker failures (including panics) cancel all in-flight work and are reported in the batch summary. Any issue that could not be processed due to a worker failure is recorded with a non-nil error in the output — it will not silently appear as a success. The process always exits cleanly; it will not hang on GitHub Actions or other CI environments.
 
 **Input Format:**
 
