@@ -644,3 +644,41 @@ func TestProcessBatch_EmptyIssues(t *testing.T) {
 		t.Fatalf("got %d results, want 0", len(results))
 	}
 }
+
+// TestProcessBatch_ZeroWorkers verifies the numWorkers<1 guard: passing 0 is
+// treated as 1 rather than panicking or hanging.
+func TestProcessBatch_ZeroWorkers(t *testing.T) {
+	t.Parallel()
+
+	issues := makeIssues(3)
+	results, err := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 0, successExecutor)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != len(issues) {
+		t.Fatalf("got %d results, want %d", len(results), len(issues))
+	}
+}
+
+// TestProcessBatch_VerboseLogging exercises the verbose code paths to ensure
+// they do not race or panic under concurrent workers.
+func TestProcessBatch_VerboseLogging(t *testing.T) {
+	// Not parallel: mutates the package-level verbose flag.
+	prev := verbose
+	verbose = true
+	t.Cleanup(func() { verbose = prev })
+
+	errExecutor := func(_ context.Context, issue *pipeline.Issue, _ *config.Config, _ *pipeline.Dependencies, _ []string, _ bool) (*pipeline.Result, error) {
+		// Alternate success/failure so both verbose branches are exercised.
+		if issue.Number%2 == 0 {
+			return nil, fmt.Errorf("even issue %d failed", issue.Number)
+		}
+		return &pipeline.Result{IssueNumber: issue.Number}, nil
+	}
+
+	issues := makeIssues(4)
+	results, _ := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 2, errExecutor)
+	if len(results) != len(issues) {
+		t.Fatalf("got %d results, want %d", len(results), len(issues))
+	}
+}
