@@ -645,6 +645,19 @@ func TestProcessBatch_EmptyIssues(t *testing.T) {
 	}
 }
 
+// TestProcessBatch_DelegatesViaWrapper verifies that the public processBatch
+// function correctly delegates to processBatchWithExecutor. An empty issue
+// list is used so ExecutePipeline is never called (no network I/O).
+func TestProcessBatch_DelegatesViaWrapper(t *testing.T) {
+	results, err := processBatch(context.Background(), nil, &config.Config{}, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("got %d results, want 0", len(results))
+	}
+}
+
 // TestProcessBatch_ZeroWorkers verifies the numWorkers<1 guard: passing 0 is
 // treated as 1 rather than panicking or hanging.
 func TestProcessBatch_ZeroWorkers(t *testing.T) {
