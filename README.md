@@ -100,14 +100,15 @@ Simili provides a powerful CLI for local development, testing, and batch operati
 Bulk index issues from a GitHub repository into the vector database.
 
 ```bash
-simili index --repo owner/repo --workers 5 --limit 100
+simili index --repo owner/repo --workers 5
 ```
 
 **Flags:**
 - `--repo` (required): Target repository (owner/name)
-- `--workers`: Number of concurrent workers (default: 5)
 - `--since`: Start from issue number or timestamp
-- `--limit`: Maximum issues to index
+- `--workers`: Number of concurrent workers (default: 5)
+- `--token`: GitHub token override (defaults to `GITHUB_TOKEN` env var)
+- `--include-prs`: Index pull requests in addition to issues (default: true)
 - `--dry-run`: Simulate without writing to database
 
 **Error handling:** If any worker encounters an unrecoverable error (including a panic), the command exits with a non-zero status code and logs the failure. All in-flight workers are cancelled cleanly before exit — the process will not hang.
