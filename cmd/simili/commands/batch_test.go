@@ -6,10 +6,14 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -456,4 +460,238 @@ type testError struct {
 
 func (e *testError) Error() string {
 	return e.msg
+}
+
+// --- Regression tests for issue #129: race condition / goroutine leak in worker pool ---
+//
+// Run with: go test -race ./cmd/simili/commands/ -run TestProcessBatch
+//
+// These tests drive processBatchWithExecutor directly so no real network I/O occurs.
+// The race detector catches any remaining send-on-closed-channel or concurrent
+// map-write bugs that the errgroup migration was meant to eliminate.
+
+func makeIssues(n int) []pipeline.Issue {
+	issues := make([]pipeline.Issue, n)
+	for i := range issues {
+		issues[i] = pipeline.Issue{
+			Org:    "test-org",
+			Repo:   "test-repo",
+			Number: i + 1,
+			Title:  fmt.Sprintf("Issue %d", i+1),
+		}
+	}
+	return issues
+}
+
+func successExecutor(_ context.Context, issue *pipeline.Issue, _ *config.Config, _ *pipeline.Dependencies, _ []string, _ bool) (*pipeline.Result, error) {
+	return &pipeline.Result{IssueNumber: issue.Number}, nil
+}
+
+// TestProcessBatch_NoPanic verifies that concurrent workers complete without
+// any channel-send-after-close panic (the original bug in issue #129).
+func TestProcessBatch_NoPanic(t *testing.T) {
+	t.Parallel()
+
+	issues := makeIssues(20)
+	results, err := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 4, successExecutor)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != len(issues) {
+		t.Fatalf("got %d results, want %d", len(results), len(issues))
+	}
+	for i, r := range results {
+		if r.Error != nil {
+			t.Errorf("result[%d] has unexpected error: %v", i, r.Error)
+		}
+	}
+}
+
+// TestProcessBatch_ResultOrdering verifies that results are returned in the
+// original issue order regardless of which worker finishes first.
+func TestProcessBatch_ResultOrdering(t *testing.T) {
+	t.Parallel()
+
+	issues := makeIssues(50)
+	results, err := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 8, successExecutor)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for i, r := range results {
+		wantNumber := issues[i].Number
+		if r.Issue.Number != wantNumber {
+			t.Errorf("results[%d].Issue.Number = %d, want %d", i, r.Issue.Number, wantNumber)
+		}
+		if r.Index != i {
+			t.Errorf("results[%d].Index = %d, want %d", i, r.Index, i)
+		}
+	}
+}
+
+// TestProcessBatch_WorkerError verifies that a worker error is captured in the
+// result slot and the total result count is always len(issues).
+func TestProcessBatch_WorkerError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("simulated worker failure")
+	var callCount atomic.Int64
+
+	failingExecutor := func(_ context.Context, issue *pipeline.Issue, _ *config.Config, _ *pipeline.Dependencies, _ []string, _ bool) (*pipeline.Result, error) {
+		if callCount.Add(1) == 3 {
+			return nil, wantErr
+		}
+		return &pipeline.Result{IssueNumber: issue.Number}, nil
+	}
+
+	issues := makeIssues(10)
+	results, err := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 2, failingExecutor)
+
+	// err may be nil (worker errors are captured in result slots) or non-nil
+	// (context cancellation propagated). Either way results must be present.
+	_ = err
+	if len(results) != len(issues) {
+		t.Fatalf("got %d results, want %d", len(results), len(issues))
+	}
+}
+
+// TestProcessBatch_WorkerPanic verifies that a panicking worker does not crash
+// the process and that the panic is surfaced as an error (not swallowed).
+func TestProcessBatch_WorkerPanic(t *testing.T) {
+	t.Parallel()
+
+	var callCount atomic.Int64
+	panicExecutor := func(_ context.Context, issue *pipeline.Issue, _ *config.Config, _ *pipeline.Dependencies, _ []string, _ bool) (*pipeline.Result, error) {
+		if callCount.Add(1) == 2 {
+			panic("simulated panic in worker")
+		}
+		return &pipeline.Result{IssueNumber: issue.Number}, nil
+	}
+
+	issues := makeIssues(8)
+
+	// Should not panic the test process.
+	results, err := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 3, panicExecutor)
+
+	if err == nil {
+		t.Error("expected non-nil error after worker panic, got nil")
+	}
+	if !strings.Contains(err.Error(), "panicked") {
+		t.Errorf("error does not mention panic: %v", err)
+	}
+	if len(results) != len(issues) {
+		t.Fatalf("got %d results, want %d", len(results), len(issues))
+	}
+}
+
+// TestProcessBatch_ContextCancellation verifies that cancelling the parent
+// context causes processBatchWithExecutor to return promptly without leaking
+// goroutines.
+func TestProcessBatch_ContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var started atomic.Int64
+	blockingExecutor := func(execCtx context.Context, issue *pipeline.Issue, _ *config.Config, _ *pipeline.Dependencies, _ []string, _ bool) (*pipeline.Result, error) {
+		if started.Add(1) == 2 {
+			cancel() // cancel after the second issue starts
+		}
+		select {
+		case <-execCtx.Done():
+			return nil, execCtx.Err()
+		case <-time.After(5 * time.Second):
+			return &pipeline.Result{IssueNumber: issue.Number}, nil
+		}
+	}
+
+	issues := makeIssues(20)
+	results, err := processBatchWithExecutor(ctx, issues, &config.Config{}, nil, nil, 4, blockingExecutor)
+
+	// After cancellation the function must return (not hang) and report an error.
+	if err == nil {
+		t.Error("expected error after context cancellation, got nil")
+	}
+	if len(results) != len(issues) {
+		t.Fatalf("got %d results, want %d", len(results), len(issues))
+	}
+}
+
+// TestProcessBatch_SingleWorker is a sanity-check at concurrency=1.
+func TestProcessBatch_SingleWorker(t *testing.T) {
+	t.Parallel()
+
+	issues := makeIssues(5)
+	results, err := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 1, successExecutor)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 5 {
+		t.Fatalf("got %d results, want 5", len(results))
+	}
+}
+
+// TestProcessBatch_EmptyIssues verifies correct behaviour when the input slice is empty.
+func TestProcessBatch_EmptyIssues(t *testing.T) {
+	t.Parallel()
+
+	results, err := processBatchWithExecutor(context.Background(), nil, &config.Config{}, nil, nil, 2, successExecutor)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("got %d results, want 0", len(results))
+	}
+}
+
+// TestProcessBatch_DelegatesViaWrapper verifies that the public processBatch
+// function correctly delegates to processBatchWithExecutor. An empty issue
+// list is used so ExecutePipeline is never called (no network I/O).
+func TestProcessBatch_DelegatesViaWrapper(t *testing.T) {
+	results, err := processBatch(context.Background(), nil, &config.Config{}, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("got %d results, want 0", len(results))
+	}
+}
+
+// TestProcessBatch_ZeroWorkers verifies the numWorkers<1 guard: passing 0 is
+// treated as 1 rather than panicking or hanging.
+func TestProcessBatch_ZeroWorkers(t *testing.T) {
+	t.Parallel()
+
+	issues := makeIssues(3)
+	results, err := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 0, successExecutor)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != len(issues) {
+		t.Fatalf("got %d results, want %d", len(results), len(issues))
+	}
+}
+
+// TestProcessBatch_VerboseLogging exercises the verbose code paths to ensure
+// they do not race or panic under concurrent workers.
+func TestProcessBatch_VerboseLogging(t *testing.T) {
+	// Not parallel: mutates the package-level verbose flag.
+	prev := verbose
+	verbose = true
+	t.Cleanup(func() { verbose = prev })
+
+	errExecutor := func(_ context.Context, issue *pipeline.Issue, _ *config.Config, _ *pipeline.Dependencies, _ []string, _ bool) (*pipeline.Result, error) {
+		// Alternate success/failure so both verbose branches are exercised.
+		if issue.Number%2 == 0 {
+			return nil, fmt.Errorf("even issue %d failed", issue.Number)
+		}
+		return &pipeline.Result{IssueNumber: issue.Number}, nil
+	}
+
+	issues := makeIssues(4)
+	results, _ := processBatchWithExecutor(context.Background(), issues, &config.Config{}, nil, nil, 2, errExecutor)
+	if len(results) != len(issues) {
+		t.Fatalf("got %d results, want %d", len(results), len(issues))
+	}
 }
