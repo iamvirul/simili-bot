@@ -126,3 +126,91 @@ func TestEndToEndPipeline(t *testing.T) {
 		}
 	}
 }
+
+// TestEndToEndPipeline_GitHubNative exercises the "issue-triage-github" preset
+// which uses the github_native search backend (no Qdrant, no embedding key).
+// This ensures the zero-config deployment path builds and runs without errors.
+func TestEndToEndPipeline_GitHubNative(t *testing.T) {
+	cfg := &config.Config{
+		Search: config.SearchConfig{
+			Backend: "github_native",
+		},
+		Defaults: config.DefaultsConfig{
+			SimilarityThreshold: 0.15,
+			MaxSimilarToShow:    5,
+			DuplicateCandidates: 5,
+		},
+	}
+	cfg.ApplyDefaults()
+
+	issue := &pipeline.Issue{
+		Org:    "test-org",
+		Repo:   "test-repo",
+		Number: 42,
+		Title:  "GitHub Native Pipeline Test Issue",
+		Body:   "Verify the github_native preset pipeline runs end-to-end in DryRun mode.",
+		State:  "open",
+	}
+
+	ctx := context.Background()
+	pCtx := pipeline.NewContext(ctx, issue, cfg)
+
+	deps := &pipeline.Dependencies{
+		DryRun: true,
+	}
+
+	registry := pipeline.NewRegistry()
+	steps.RegisterAll(registry)
+
+	// Use the "issue-triage-github" preset — the github_native equivalent
+	stepNames := pipeline.ResolveSteps(nil, "issue-triage-github")
+
+	p, err := registry.BuildFromNames(stepNames, deps)
+	if err != nil {
+		t.Fatalf("Failed to build github_native pipeline: %v", err)
+	}
+
+	startTime := time.Now()
+	err = p.Run(pCtx)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		t.Fatalf("GitHub-native pipeline execution failed: %v", err)
+	}
+
+	t.Logf("GitHub-native pipeline passed in %v", duration)
+	t.Logf("Result: %+v", pCtx.Result)
+
+	if pCtx.Result.Skipped {
+		t.Logf("Pipeline skipped: %s", pCtx.Result.SkipReason)
+	} else {
+		if pCtx.Result.IssueNumber != 42 {
+			t.Errorf("Expected issue number 42, got %d", pCtx.Result.IssueNumber)
+		}
+	}
+}
+
+// TestGitHubNativeConfigValidation verifies that config validation passes for
+// the github_native backend when Qdrant fields are completely empty.
+func TestGitHubNativeConfigValidation(t *testing.T) {
+	cfg := &config.Config{
+		Search: config.SearchConfig{
+			Backend: "github_native",
+		},
+	}
+	cfg.ApplyDefaults()
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("github_native config should validate without Qdrant fields: %v", err)
+	}
+
+	// Verify Qdrant fields are empty and that's OK
+	if cfg.Qdrant.URL != "" || cfg.Qdrant.APIKey != "" || cfg.Qdrant.Collection != "" || cfg.Qdrant.PRCollection != "" {
+		t.Error("Expected empty Qdrant fields for github_native backend")
+	}
+
+	// Verify the backend was set correctly
+	if cfg.Search.Backend != "github_native" {
+		t.Errorf("Expected search.backend 'github_native', got %q", cfg.Search.Backend)
+	}
+}

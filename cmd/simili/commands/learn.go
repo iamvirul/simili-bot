@@ -77,6 +77,10 @@ func runLearn(cmd *cobra.Command, args []string) {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	if cfg.Search.Backend != "qdrant" {
+		log.Fatalf("The 'learn' command requires the 'qdrant' search backend for semantic repository routing. Current backend is %q.", cfg.Search.Backend)
+	}
+
 	// 2. Initialize GitHub Client
 	token := learnToken
 	if token == "" {

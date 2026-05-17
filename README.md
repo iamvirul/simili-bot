@@ -223,6 +223,21 @@ Notes:
 - `llm.api_key` can be omitted if `GEMINI_API_KEY` is set.
 - You can override the model at runtime with `LLM_MODEL`.
 
+### Search Backends
+
+Simili supports multiple search backends for similarity detection, enabling zero-dependency setups:
+
+- **`qdrant` (default)**: Uses Qdrant vector database for semantic search. Requires `qdrant` configuration and an `embedding` provider.
+- **`github_native`**: A zero-dependency hybrid search using GitHub's native issue search API. It does not require Qdrant or embedding configuration. *Note: `simili learn` is not supported with this backend.*
+- **`bm25`**: A local keyword-based search.
+
+To configure the backend, set it in your `simili.yaml`:
+
+```yaml
+search:
+  backend: "github_native" # options: "qdrant" (default), "github_native", "bm25"
+```
+
 ### `simili auto-close`
 
 Scan all open issues labelled `potential-duplicate` and close those whose grace period has expired with no human activity. Closed issues are relabelled from `potential-duplicate` → `duplicate`.

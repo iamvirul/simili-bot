@@ -1,0 +1,146 @@
+# =============================================================================
+# E2E Cleanup — Delete orphaned test repos and Qdrant collections
+# =============================================================================
+# Runs weekly (Sunday 03:00 UTC) and on manual trigger.
+# Deletes simili-e2e-* repos older than 24 hours and their matching
+# Qdrant collections.
+#
+# Required secrets:
+#   BOT_PAT        – Bot user PAT (repo + delete_repo scopes)
+#   QDRANT_URL     – Qdrant cluster URL (optional)
+#   QDRANT_API_KEY – Qdrant API key (optional)
+# =============================================================================
+
+name: E2E Cleanup
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'   # Every Sunday 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  BOT_NAME: "gh-simili-bot"
+
+jobs:
+  cleanup:
+    name: Clean Orphaned E2E Resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # ----- 1. Delete stale test repos -----
+      - name: Clean orphaned E2E repos
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::BOT_PAT not set — skipping repo cleanup"
+            exit 0
+          fi
+
+          CUTOFF=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)
+
+          echo "Cutoff: $CUTOFF"
+          DELETED=0
+          FAILED=0
+
+          # Collect repo list first (avoid subshell from pipe)
+          REPOS=$(gh repo list "${{ env.BOT_NAME }}" \
+            --json name,createdAt \
+            --jq '.[] | select(.name | startswith("simili-e2e-")) | "\(.name) \(.createdAt)"' \
+            --limit 200)
+
+          if [ -z "$REPOS" ]; then
+            echo "No simili-e2e-* repos found."
+          else
+            # Process via while loop with <<< to stay in the same shell
+            while read -r NAME CREATED; do
+              [ -z "$NAME" ] && continue
+              if [[ "$CREATED" < "$CUTOFF" ]]; then
+                echo "Deleting ${{ env.BOT_NAME }}/$NAME (created $CREATED)…"
+                if gh repo delete "${{ env.BOT_NAME }}/$NAME" --yes 2>/dev/null; then
+                  DELETED=$((DELETED + 1))
+                else
+                  echo "  ⚠️ Failed to delete (missing delete_repo scope?)"
+                  FAILED=$((FAILED + 1))
+                fi
+              else
+                echo "Keeping ${{ env.BOT_NAME }}/$NAME (created $CREATED — still fresh)"
+              fi
+            done <<< "$REPOS"
+          fi
+
+          {
+            echo "### 🗑️ Repo cleanup"
+            echo "Deleted **$DELETED** orphaned E2E repo(s)."
+            if [ "$FAILED" -gt 0 ]; then
+              echo "⚠️ **$FAILED** deletion(s) failed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ----- 2. Delete stale Qdrant collections -----
+      - name: Clean orphaned Qdrant collections
+        if: always()
+        env:
+          QDR_URL: ${{ secrets.QDRANT_URL }}
+          QDR_KEY: ${{ secrets.QDRANT_API_KEY }}
+        run: |
+          if [ -z "$QDR_URL" ] || [ -z "$QDR_KEY" ]; then
+            echo "::warning::Qdrant secrets not set — skipping collection cleanup"
+            exit 0
+          fi
+
+          # List E2E collections — surface auth/network errors clearly.
+          LIST_OUTPUT=$(curl -sf "$QDR_URL/collections" \
+            -H "api-key: $QDR_KEY" 2>&1) || {
+            echo "::error::Failed to list Qdrant collections: $LIST_OUTPUT"
+            echo "### 🗑️ Qdrant cleanup" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ Failed to list collections (auth/network error)." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          COLLECTIONS=$(echo "$LIST_OUTPUT" \
+            | jq -r '.result.collections[].name // empty' \
+            | grep '^simili-e2e-test-' || true)
+
+          DELETED=0
+          FAILED=0
+          SKIPPED=0
+          if [ -z "$COLLECTIONS" ]; then
+            echo "No orphaned Qdrant collections found."
+          else
+            for COLL in $COLLECTIONS; do
+              # Extract the run-id-backend suffix to check if a matching repo still exists.
+              # Collection format: simili-e2e-test-<run_id>-<backend>
+              REPO_SUFFIX=$(echo "$COLL" | sed 's/^simili-e2e-test-//')
+              REPO_NAME="simili-e2e-$REPO_SUFFIX"
+              if gh repo view "${{ env.BOT_NAME }}/$REPO_NAME" --json name >/dev/null 2>&1; then
+                echo "Skipping $COLL — matching repo still active"
+                SKIPPED=$((SKIPPED + 1))
+                continue
+              fi
+
+              echo "Deleting orphaned Qdrant collection: $COLL"
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+                "$QDR_URL/collections/$COLL" \
+                -H "api-key: $QDR_KEY" \
+                -H "Content-Type: application/json")
+              if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                DELETED=$((DELETED + 1))
+              else
+                echo "  ⚠️ Failed (HTTP $HTTP_CODE)"
+                FAILED=$((FAILED + 1))
+              fi
+            done
+          fi
+
+          {
+            echo "### 🗑️ Qdrant cleanup"
+            echo "Deleted **$DELETED** orphaned collection(s). Skipped **$SKIPPED** active."
+            if [ "$FAILED" -gt 0 ]; then
+              echo "⚠️ **$FAILED** deletion(s) failed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

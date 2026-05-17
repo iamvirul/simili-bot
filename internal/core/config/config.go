@@ -8,6 +8,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -306,6 +307,10 @@ func (c *Config) Validate() error {
 					field.envVar,
 				)
 			}
+		}
+	} else if c.Search.Backend == "github_native" {
+		if c.Qdrant.URL != "" || c.Qdrant.APIKey != "" || c.Qdrant.Collection != "" || c.Qdrant.PRCollection != "" {
+			log.Printf("WARN: search.backend is 'github_native' but Qdrant configuration is present. Qdrant will be ignored.")
 		}
 	}
 	return nil

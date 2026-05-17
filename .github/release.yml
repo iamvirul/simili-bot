@@ -1,0 +1,30 @@
+changelog:
+  exclude:
+    - labels:
+        - duplicate
+        - invalid
+        - wontfix
+  categories:
+    - title: "⚠️ Breaking Changes"
+      labels:
+        - breaking
+    - title: "✨ New Features"
+      labels:
+        - enhancement
+    - title: "🐛 Bug Fixes"
+      labels:
+        - bug
+        - fix
+    - title: "⚡ Performance"
+      labels:
+        - performance
+    - title: "🔧 Reliability & Maintenance"
+      labels:
+        - reliability
+        - automation
+        - workflow
+        - github-actions
+    - title: "📚 Documentation"
+      labels:
+        - documentation
+    - title: "🔩 Other Changes"

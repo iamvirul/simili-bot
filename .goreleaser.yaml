@@ -10,3 +10,34 @@ builds:
     goarch:
       - amd64
       - arm64
+
+changelog:
+  use: github
+  sort: asc
+
+release:
+  header: |
+    ## Simili-Bot {{ .Tag }}
+
+    AI-powered duplicate issue/PR detection and cross-repo search for GitHub.
+
+    [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/similigh/simili-bot/blob/main/LICENSE)
+    [![GitHub Release](https://img.shields.io/github/v/release/similigh/simili-bot?color=blue)](https://github.com/similigh/simili-bot/releases/latest)
+
+  footer: |
+
+    ## Quickstart
+
+    **GitHub Action** — add to your workflow:
+    ```yaml
+    - uses: similigh/simili-bot@{{ .Tag }}
+      with:
+        github_token: ${{ "{{" }} secrets.GITHUB_TOKEN {{ "}}" }}
+    ```
+
+    **CLI** — download the binary for your platform from the assets below, or install via Go:
+    ```bash
+    go install github.com/similigh/simili-bot/cmd/simili@{{ .Tag }}
+    ```
+
+    **Full Changelog**: https://github.com/similigh/simili-bot/compare/{{ .PreviousTag }}...{{ .Tag }}
